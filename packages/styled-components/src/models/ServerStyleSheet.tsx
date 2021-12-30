@@ -12,6 +12,12 @@ declare const __SERVER__: boolean;
 
 const CLOSING_TAG_R = /^\s*<\/[a-z]/i;
 
+/**
+ * Type for the pipe function provided by calling renderToPipeableStream
+ * TODO: use corresponding type from @types/react-dom when available
+ */
+type PipeFn = (destination: streamInternal.Writable) => void;
+
 export default class ServerStyleSheet {
   instance: StyleSheet;
   sealed: boolean;
@@ -33,6 +39,51 @@ export default class ServerStyleSheet {
 
     return `<style ${htmlAttr}>${css}</style>`;
   };
+
+  _guard() {
+    if (!__SERVER__ || IS_BROWSER) {
+      throw styledError(3);
+    } else if (this.sealed) {
+      throw styledError(2);
+    }
+  }
+
+  _getNodeTransformStream(): streamInternal.Transform {
+    // eslint-disable-next-line global-require, @typescript-eslint/no-var-requires
+    const { Transform } = require('stream');
+
+    const { instance: sheet, _emitSheetCSS } = this;
+
+    return new Transform({
+      transform: function appendStyleChunks(
+        chunk: string,
+        /* encoding */
+        _: string,
+        callback: Function
+      ) {
+        // Get the chunk and retrieve the sheet's CSS as an HTML chunk,
+        // then reset its rules so we get only new ones for the next chunk
+        const renderedHtml = chunk.toString();
+        const html = _emitSheetCSS();
+
+        sheet.clearTag();
+
+        // prepend style html to chunk, unless the start of the chunk is a
+        // closing tag in which case append right after that
+        if (CLOSING_TAG_R.test(renderedHtml)) {
+          const endOfClosingTag = renderedHtml.indexOf('>') + 1;
+          const before = renderedHtml.slice(0, endOfClosingTag);
+          const after = renderedHtml.slice(endOfClosingTag);
+
+          this.push(before + html + after);
+        } else {
+          this.push(html + renderedHtml);
+        }
+
+        callback();
+      },
+    });
+  }
 
   collectStyles(children: any): JSX.Element {
     if (this.sealed) {
@@ -72,61 +123,33 @@ export default class ServerStyleSheet {
     return [<style {...props} key="sc-0-0" />];
   };
 
-  // eslint-disable-next-line consistent-return
-  // @ts-expect-error alternate return types are not possible due to code transformation
   interleaveWithNodeStream(input: Readable): streamInternal.Transform {
-    if (!__SERVER__ || IS_BROWSER) {
-      throw styledError(3);
-    } else if (this.sealed) {
-      throw styledError(2);
-    }
+    this._guard();
+    this.seal();
 
-    if (__SERVER__) {
-      this.seal();
+    const readableStream: Readable = input;
+    const transformer = this._getNodeTransformStream();
 
-      // eslint-disable-next-line global-require, @typescript-eslint/no-var-requires
-      const { Transform } = require('stream');
+    readableStream.on('error', err => {
+      // forward the error to the transform stream
+      transformer.emit('error', err);
+    });
 
-      const readableStream: Readable = input;
-      const { instance: sheet, _emitSheetCSS } = this;
+    return readableStream.pipe(transformer);
+  }
 
-      const transformer: streamInternal.Transform = new Transform({
-        transform: function appendStyleChunks(
-          chunk: string,
-          /* encoding */
-          _: string,
-          callback: Function
-        ) {
-          // Get the chunk and retrieve the sheet's CSS as an HTML chunk,
-          // then reset its rules so we get only new ones for the next chunk
-          const renderedHtml = chunk.toString();
-          const html = _emitSheetCSS();
+  interleaveWithPipe(pipe: PipeFn): PipeFn {
+    this._guard();
+    this.seal();
 
-          sheet.clearTag();
+    // Keep function signature the same, route all data through the transform stream
+    // Error handling is done on the caller's side using renderToPipeableStream API
+    return (destination) => {
+      const transformStream = this._getNodeTransformStream();
+      const outputStream = transformStream.pipe(destination);
 
-          // prepend style html to chunk, unless the start of the chunk is a
-          // closing tag in which case append right after that
-          if (CLOSING_TAG_R.test(renderedHtml)) {
-            const endOfClosingTag = renderedHtml.indexOf('>') + 1;
-            const before = renderedHtml.slice(0, endOfClosingTag);
-            const after = renderedHtml.slice(endOfClosingTag);
-
-            this.push(before + html + after);
-          } else {
-            this.push(html + renderedHtml);
-          }
-
-          callback();
-        },
-      });
-
-      readableStream.on('error', err => {
-        // forward the error to the transform stream
-        transformer.emit('error', err);
-      });
-
-      return readableStream.pipe(transformer);
-    }
+      pipe(outputStream);
+    };
   }
 
   seal = (): void => {
